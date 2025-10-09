@@ -12,7 +12,7 @@ A complete IoT camera system using ESP32-S3 with OV5640 camera module that autom
 └─────────────────┘                  └─────────────────┘                └─────────────────┘
 ```
 
-I hosted the project using [NGROK][https://ngrok.com/] for this development project. 
+I hosted the project using [NGROK](https://ngrok.com/) for this development project. 
 
 ##  Project Overview
 

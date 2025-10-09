@@ -242,7 +242,7 @@ uploads/
 
 ## Troubleshooting
 
-### Common Issues
+### Issues I Experienced
 
 1. **Camera Initialization Failed:**
    - Check camera module connections
@@ -292,17 +292,6 @@ Enable verbose debugging by checking serial monitor output. The ESP32 provides c
 - **HTTP multipart form upload** with proper headers
 - **Memory-efficient image transmission**
 - **Error recovery and retry logic**
-
-## TODO / Future Improvements
-
-- [ ] Add image compression options
-- [ ] Implement motion detection
-- [ ] Add battery level monitoring
-- [ ] Create web interface for image viewing
-- [ ] Add FTP upload option
-- [ ] Implement time-lapse functionality
-- [ ] Add remote configuration via web interface
-- [ ] Implement secure HTTPS upload
 
 ## License
 

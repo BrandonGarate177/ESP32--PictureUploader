@@ -3,5 +3,12 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-.vscode 
+.vscode
+
+# WiFi credentials - keep private!
+src/wifi_config.h
+
+# OS files
+.DS_Store
+Thumbs.db
 

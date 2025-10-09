@@ -11,11 +11,13 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <HTTPClient.h>
 #include "esp_camera.h"
 
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 #include "utilities.h"
+#include "wifi_config.h"
 
 
 void        startCameraServer();
@@ -24,7 +26,11 @@ XPowersPMU  PMU;
 WiFiMulti   wifiMulti;
 String      hostName = "LilyGo-Cam-";
 String      ipAddress = "";
-bool        use_ap_mode = true;
+bool        use_ap_mode = false;
+
+unsigned long lastCaptureTime = 0;
+const unsigned long captureInterval = 30000; // Capture every 30 seconds (adjust as needed)
+int imageCounter = 0;
 
 
 
@@ -67,32 +73,26 @@ void setup()
      * If using station mode, please change use_ap_mode to false,
      * and fill in your account password in wifiMulti
     ***********************************/
-    if (use_ap_mode) {
+ 
 
-        WiFi.mode(WIFI_AP);
-        hostName += WiFi.macAddress().substring(0, 5);
-        WiFi.softAP(hostName.c_str());
-        ipAddress = WiFi.softAPIP().toString();
-        Serial.print("Started AP mode host name :");
-        Serial.print(hostName);
-        Serial.print("IP address is :");
-        Serial.println(WiFi.softAPIP().toString());
-
-    } else {
-
-        wifiMulti.addAP("ssid_from_AP_1", "your_password_for_AP_1");
-        wifiMulti.addAP("ssid_from_AP_2", "your_password_for_AP_2");
-        wifiMulti.addAP("ssid_from_AP_3", "your_password_for_AP_3");
-
-
-        Serial.println("Connecting Wifi...");
-        if (wifiMulti.run() == WL_CONNECTED) {
-            Serial.println("");
-            Serial.println("WiFi connected");
-            Serial.println("IP address: ");
-            Serial.println(WiFi.localIP());
-        }
+    // Connect to WiFi using credentials from wifi_config.h
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    Serial.print("Connecting to WiFi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(1000);
+        Serial.print(".");
     }
+    
+    Serial.println("");
+    Serial.println("WiFi connected successfully!");
+    Serial.print("Network: ");
+    Serial.println(WIFI_SSID);
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.print("Signal strength: ");
+    Serial.println(WiFi.RSSI());
+    
 
 
 
@@ -199,13 +199,205 @@ void setup()
 
 
     /*********************************
-     *  step 4 : start camera web server
+     *  step 4 : Camera ready for periodic capture
     ***********************************/
-    startCameraServer();
+    Serial.println("Camera initialized and ready for periodic image capture");
+    // startCameraServer(); // Commented out - we're uploading images instead of serving them
 
 }
 
 void loop()
 {
-    delay(10000);
+    unsigned long currentTime = millis();
+    
+    // Check if it's time to capture an image
+    if (currentTime - lastCaptureTime >= captureInterval) {
+        captureAndProcessImage();
+        lastCaptureTime = currentTime;
+    }
+    
+    delay(100); // Short delay to prevent excessive CPU usage
+}
+
+void captureAndProcessImage() {
+    Serial.println("Capturing image...");
+    
+    // Take a picture
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        Serial.println("Camera capture failed");
+        return;
+    }
+    
+    Serial.printf("Image captured! Size: %d bytes, Width: %d, Height: %d\n", 
+                  fb->len, fb->width, fb->height);
+    
+    // Upload the image to server
+    uploadImageToServer(fb->buf, fb->len);
+    
+    // Increment counter and show info
+    imageCounter++;
+    Serial.printf("Image #%d processed\n", imageCounter);
+    
+    // Don't forget to return the frame buffer
+    esp_camera_fb_return(fb);
+}
+
+// Upload image to server via HTTP POST with multipart form data
+void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
+    Serial.println("=== STARTING IMAGE UPLOAD DEBUG ===");
+    Serial.printf("WiFi Status: %d (3=Connected)\n", WiFi.status());
+    Serial.printf("Image data pointer: %p\n", imageData);
+    Serial.printf("Image size: %d bytes\n", imageSize);
+    
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected, skipping upload");
+        return;
+    }
+    
+    if (!imageData || imageSize == 0) {
+        Serial.println("Invalid image data or size");
+        return;
+    }
+    
+    // Check available heap memory
+    Serial.printf("Free heap before HTTP: %d bytes\n", ESP.getFreeHeap());
+    
+    HTTPClient http;
+    
+    // Configure HTTP client for ngrok
+    String url = "http://484ec20e9888.ngrok-free.app/upload";
+    Serial.printf("Connecting to: %s\n", url.c_str());
+    
+    bool httpBeginResult = http.begin(url);
+    Serial.printf("HTTP begin result: %s\n", httpBeginResult ? "SUCCESS" : "FAILED");
+    
+    if (!httpBeginResult) {
+        Serial.println("Failed to initialize HTTP client");
+        return;
+    }
+    
+    http.addHeader("ngrok-skip-browser-warning", "true");
+    http.addHeader("User-Agent", "ESP32-Camera/1.0");
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Handle redirects
+    http.setTimeout(15000); // Re-add timeout but shorter
+    
+    Serial.println("✓ HTTP client configured, starting upload...");
+    
+    // Create multipart form data boundary
+    String boundary = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+    String contentType = "multipart/form-data; boundary=" + boundary;
+    http.addHeader("Content-Type", contentType);
+    
+    // Calculate total payload size
+    String header = "--" + boundary + "\r\n";
+    header += "Content-Disposition: form-data; name=\"file\"; filename=\"image.jpg\"\r\n";
+    header += "Content-Type: image/jpeg\r\n\r\n";
+    
+    String footer = "\r\n--" + boundary + "--\r\n";
+    
+    size_t totalSize = header.length() + imageSize + footer.length();
+    
+    // Check if we have enough memory
+    Serial.printf("Free heap before malloc: %d bytes\n", ESP.getFreeHeap());
+    Serial.printf("Trying to allocate: %d bytes for payload\n", totalSize);
+    
+    // Create payload buffer (more memory efficient)
+    uint8_t* payload = (uint8_t*)malloc(totalSize);
+    if (!payload) {
+        Serial.printf("Failed to allocate %d bytes for payload\n", totalSize);
+        Serial.printf("Available heap: %d bytes\n", ESP.getFreeHeap());
+        http.end();
+        return;
+    }
+    
+    Serial.printf("✓ Successfully allocated %d bytes for payload\n", totalSize);
+    Serial.printf("Free heap after malloc: %d bytes\n", ESP.getFreeHeap());
+    
+    // Build multipart payload with proper binary handling
+    size_t offset = 0;
+    
+    // Add header
+    memcpy(payload + offset, header.c_str(), header.length());
+    offset += header.length();
+    
+    // Add binary image data (NO CONVERSION - keeps original bytes)
+    memcpy(payload + offset, imageData, imageSize);
+    offset += imageSize;
+    
+    // Add footer
+    memcpy(payload + offset, footer.c_str(), footer.length());
+    
+    Serial.printf("✓ Payload assembled successfully\n");
+    Serial.printf("Total payload size: %d bytes\n", totalSize);
+    Serial.printf("  - Header size: %d bytes\n", header.length());
+    Serial.printf("  - Image size: %d bytes\n", imageSize);
+    Serial.printf("  - Footer size: %d bytes\n", footer.length());
+    
+    // Print first few bytes of payload for verification
+    Serial.print("First 20 bytes of payload: ");
+    for (int i = 0; i < 20 && i < totalSize; i++) {
+        Serial.printf("%02X ", payload[i]);
+    }
+    Serial.println();
+    
+    Serial.println("Sending POST request...");
+    
+    // Send binary POST request
+    int httpResponseCode = http.POST(payload, totalSize);
+    
+    Serial.printf("POST request completed with response code: %d\n", httpResponseCode);
+    
+    // Clean up memory
+    free(payload);
+    
+    Serial.printf("Response code received: %d\n", httpResponseCode);
+    
+    // Handle response
+    if (httpResponseCode >= 200 && httpResponseCode < 300) {
+        String response = http.getString();
+        Serial.printf("Upload successful! Response code: %d\n", httpResponseCode);
+        Serial.printf("Server response: %s\n", response.c_str());
+    } else if (httpResponseCode >= 300 && httpResponseCode < 400) {
+        Serial.printf("Redirect detected (code: %d)\n", httpResponseCode);
+        String location = http.header("Location");
+        if (location.length() > 0) {
+            Serial.printf("Redirect location: %s\n", location.c_str());
+        }
+        
+        // Print all headers for debugging
+        Serial.println("All response headers:");
+        for (int i = 0; i < http.headers(); i++) {
+            Serial.printf("  %s: %s\n", http.headerName(i).c_str(), http.header(i).c_str());
+        }
+        
+        String response = http.getString();
+        if (response.length() > 0) {
+            Serial.printf("Response body: %s\n", response.c_str());
+        }
+    } else if (httpResponseCode <= 0) {
+        Serial.printf("HTTP Connection failed! Error code: %d\n", httpResponseCode);
+        Serial.printf("Error description: %s\n", http.errorToString(httpResponseCode).c_str());
+        Serial.println("Possible causes:");
+        Serial.println("  - ngrok tunnel is down");
+        Serial.println("  - WiFi connection unstable");
+        Serial.println("  - DNS resolution failed");
+        Serial.println("  - Server not responding");
+    } else {
+        Serial.printf("Upload failed! HTTP Error code: %d\n", httpResponseCode);
+        Serial.printf("Error description: %s\n", http.errorToString(httpResponseCode).c_str());
+        String response = http.getString();
+        if (response.length() > 0) {
+            Serial.printf("Error response: %s\n", response.c_str());
+        }
+        
+        // Additional debugging info
+        Serial.printf("Connected to host: %s\n", http.connected() ? "Yes" : "No");
+        Serial.printf("Final URL: %s\n", http.getLocation().c_str());
+    }
+    
+    http.end();
+    
+    Serial.printf("Free heap after HTTP: %d bytes\n", ESP.getFreeHeap());
+    Serial.println("=== UPLOAD DEBUG COMPLETE ===\n");
 }

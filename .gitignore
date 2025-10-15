@@ -12,3 +12,10 @@ src/wifi_config.h
 .DS_Store
 Thumbs.db
 
+
+server/.env
+server/commands.txt
+
+
+
+src/server_config.h

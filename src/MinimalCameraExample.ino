@@ -13,11 +13,21 @@
 #include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include "esp_camera.h"
+#include "FS.h"
+#include "SD.h"
+#include "SPI.h"
 
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
 #include "utilities.h"
 #include "wifi_config.h"
+#include "server_config.h"
+
+// SD Card pins (adjust these based on your board's pinout)
+#define SD_CS_PIN 21
+#define SD_MOSI_PIN 19
+#define SD_MISO_PIN 18
+#define SD_SCK_PIN 5
 
 
 void        startCameraServer();
@@ -199,9 +209,42 @@ void setup()
 
 
     /*********************************
-     *  step 4 : Camera ready for periodic capture
+     *  step 4 : Initialize SD Card
     ***********************************/
-    Serial.println("Camera initialized and ready for periodic image capture");
+    Serial.println("Initializing SD card...");
+    
+    // Initialize SPI for SD card
+    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD Card initialization failed!");
+        Serial.println("Continuing without SD card support...");
+    } else {
+        uint8_t cardType = SD.cardType();
+        if (cardType == CARD_NONE) {
+            Serial.println("No SD card attached");
+        } else {
+            Serial.println("SD card initialized successfully!");
+            Serial.printf("SD Card Type: %s\n", 
+                cardType == CARD_MMC ? "MMC" :
+                cardType == CARD_SD ? "SDSC" :
+                cardType == CARD_SDHC ? "SDHC" : "UNKNOWN");
+            
+            uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+            Serial.printf("SD Card Size: %lluMB\n", cardSize);
+            
+            // Create images directory if it doesn't exist
+            if (!SD.exists("/images")) {
+                SD.mkdir("/images");
+                Serial.println("Created /images directory");
+            }
+        }
+    }
+
+    /*********************************
+     *  step 5 : Camera ready for periodic capture
+    ***********************************/
+    Serial.println("Camera initialized and ready for periodic image capture with SD storage");
     // startCameraServer(); // Commented out - we're uploading images instead of serving them
 
 }
@@ -232,8 +275,25 @@ void captureAndProcessImage() {
     Serial.printf("Image captured! Size: %d bytes, Width: %d, Height: %d\n", 
                   fb->len, fb->width, fb->height);
     
-    // Upload the image to server
-    uploadImageToServer(fb->buf, fb->len);
+    // Generate filename with timestamp
+    String filename = "/images/img_" + String(imageCounter) + "_" + String(millis()) + ".jpg";
+    
+    // Save to SD card first
+    bool savedToSD = saveImageToSD(fb->buf, fb->len, filename);
+    
+    if (savedToSD) {
+        Serial.println("Image saved to SD card successfully!");
+        
+        // Print SD card contents
+        printSDCardContents();
+        
+        // Upload from SD card to server
+        uploadImageFromSD(filename);
+    } else {
+        Serial.println("Failed to save to SD card, uploading directly from memory...");
+        // Fallback: upload directly from memory
+        uploadImageToServer(fb->buf, fb->len);
+    }
     
     // Increment counter and show info
     imageCounter++;
@@ -241,6 +301,131 @@ void captureAndProcessImage() {
     
     // Don't forget to return the frame buffer
     esp_camera_fb_return(fb);
+}
+
+bool saveImageToSD(uint8_t* imageData, size_t imageSize, String filename) {
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD card not available");
+        return false;
+    }
+    
+    Serial.printf("Saving image to SD: %s\n", filename.c_str());
+    
+    File file = SD.open(filename, FILE_WRITE);
+    if (!file) {
+        Serial.println("Failed to open file for writing");
+        return false;
+    }
+    
+    size_t bytesWritten = file.write(imageData, imageSize);
+    file.close();
+    
+    if (bytesWritten == imageSize) {
+        Serial.printf("Successfully saved %d bytes to %s\n", bytesWritten, filename.c_str());
+        return true;
+    } else {
+        Serial.printf("Write error: only %d of %d bytes written\n", bytesWritten, imageSize);
+        return false;
+    }
+}
+
+void printSDCardContents() {
+    Serial.println("\n=== SD CARD CONTENTS ===");
+    
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD card not available");
+        return;
+    }
+    
+    File root = SD.open("/");
+    if (!root) {
+        Serial.println("Failed to open root directory");
+        return;
+    }
+    
+    printDirectory(root, 0);
+    root.close();
+    
+    // Print images directory specifically
+    Serial.println("\n--- Images Directory ---");
+    File imagesDir = SD.open("/images");
+    if (imagesDir) {
+        printDirectory(imagesDir, 0);
+        imagesDir.close();
+    } else {
+        Serial.println("Images directory not found");
+    }
+    
+    Serial.println("========================\n");
+}
+
+void printDirectory(File dir, int numTabs) {
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) {
+            break;
+        }
+        
+        for (uint8_t i = 0; i < numTabs; i++) {
+            Serial.print('\t');
+        }
+        
+        Serial.print(entry.name());
+        if (entry.isDirectory()) {
+            Serial.println("/");
+            printDirectory(entry, numTabs + 1);
+        } else {
+            Serial.print("\t\t");
+            Serial.println(entry.size());
+        }
+        entry.close();
+    }
+}
+
+void uploadImageFromSD(String filename) {
+    Serial.printf("Uploading image from SD: %s\n", filename.c_str());
+    
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD card not available for upload");
+        return;
+    }
+    
+    File file = SD.open(filename);
+    if (!file) {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+    
+    size_t fileSize = file.size();
+    Serial.printf("File size: %d bytes\n", fileSize);
+    
+    // Allocate buffer for file contents
+    uint8_t* fileBuffer = (uint8_t*)malloc(fileSize);
+    if (!fileBuffer) {
+        Serial.printf("Failed to allocate %d bytes for file buffer\n", fileSize);
+        file.close();
+        return;
+    }
+    
+    // Read file into buffer
+    size_t bytesRead = file.read(fileBuffer, fileSize);
+    file.close();
+    
+    if (bytesRead != fileSize) {
+        Serial.printf("Read error: only %d of %d bytes read\n", bytesRead, fileSize);
+        free(fileBuffer);
+        return;
+    }
+    
+    Serial.printf("Successfully read %d bytes from SD card\n", bytesRead);
+    
+    // Upload using existing function
+    uploadImageToServer(fileBuffer, fileSize);
+    
+    // Clean up
+    free(fileBuffer);
+    
+    Serial.printf("Upload from SD card completed for: %s\n", filename.c_str());
 }
 
 // Upload image to server via HTTP POST with multipart form data
@@ -266,7 +451,7 @@ void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
     HTTPClient http;
     
     // Configure HTTP client for ngrok
-    String url = "http://484ec20e9888.ngrok-free.app/upload";
+    String url = SERVER_UPLOAD_URL;
     Serial.printf("Connecting to: %s\n", url.c_str());
     
     bool httpBeginResult = http.begin(url);

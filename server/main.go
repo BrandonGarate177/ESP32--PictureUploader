@@ -1,25 +1,55 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"cloud.google.com/go/storage"
+	"github.com/joho/godotenv"
 )
 
-const (
-	uploadDir = "uploads"
-	port      = ":8081"
+var (
+	port = ":8080" // Cloud Run uses PORT env var, defaulting to 8080
+)
+
+var (
+	storageClient *storage.Client
+	bucketName    string
 )
 
 func main() {
-	// Create uploads directory if it doesn't exist
-	if err := os.MkdirAll(uploadDir, 0755); err != nil {
-		log.Fatalf("Failed to create uploads directory: %v", err)
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using system environment variables")
 	}
+
+	// Get port from environment variable (required for Cloud Run)
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		port = ":" + envPort
+	}
+
+	// Get bucket name from environment variable
+	bucketName = os.Getenv("STORAGE_BUCKET")
+	println("Bucket Name:", bucketName)
+	if bucketName == "" {
+		log.Fatal("STORAGE_BUCKET environment variable is required")
+	}
+
+	// Initialize Google Cloud Storage client
+	ctx := context.Background()
+	var err error
+	storageClient, err = storage.NewClient(ctx)
+	if err != nil {
+		log.Fatalf("Failed to create storage client: %v", err)
+	}
+	defer storageClient.Close()
 
 	// Set up routes
 	http.HandleFunc("/upload", uploadHandler)
@@ -27,16 +57,11 @@ func main() {
 
 	// Start server
 	fmt.Printf("Server starting on port %s\n", port)
-	fmt.Printf("Upload endpoint: http://localhost%s/upload\n", port)
+	fmt.Printf("Upload endpoint: https://image-upload-server-719756097849.us-central1.run.app/upload\n")
+	fmt.Printf("Using storage bucket: %s\n", bucketName)
 
-	// Try to start the server with better error handling
 	if err := http.ListenAndServe(port, nil); err != nil {
-		if err.Error() == "listen tcp :8081: bind: address already in use" {
-			fmt.Printf("Port %s is already in use. Please try a different port or stop the existing server.\n", port)
-			fmt.Println("You can change the port by modifying the 'port' constant in main.go")
-		} else {
-			log.Fatalf("Server failed to start: %v", err)
-		}
+		log.Fatalf("Server failed to start: %v", err)
 	}
 }
 
@@ -89,7 +114,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	allowedExts := []string{".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 	isImage := false
 	for _, allowedExt := range allowedExts {
-		if ext == allowedExt {
+		if strings.ToLower(ext) == allowedExt {
 			isImage = true
 			break
 		}
@@ -102,21 +127,45 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Generate unique filename with timestamp
 	timestamp := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%s%s", timestamp, handler.Filename, ext)
-	filepath := filepath.Join(uploadDir, filename)
+	filename := fmt.Sprintf("%s_%s", timestamp, handler.Filename)
 
-	// Create the file on disk
-	dst, err := os.Create(filepath)
+	// Upload to Google Cloud Storage
+	ctx := context.Background()
+	bucket := storageClient.Bucket(bucketName)
+	obj := bucket.Object(filename)
+
+	// Create a writer to the GCS object
+	wc := obj.NewWriter(ctx)
+	wc.ContentType = handler.Header.Get("Content-Type")
+	if wc.ContentType == "" {
+		// Set content type based on file extension
+		switch strings.ToLower(ext) {
+		case ".jpg", ".jpeg":
+			wc.ContentType = "image/jpeg"
+		case ".png":
+			wc.ContentType = "image/png"
+		case ".gif":
+			wc.ContentType = "image/gif"
+		case ".bmp":
+			wc.ContentType = "image/bmp"
+		case ".webp":
+			wc.ContentType = "image/webp"
+		default:
+			wc.ContentType = "application/octet-stream"
+		}
+	}
+
+	// Copy the uploaded file to GCS
+	_, err = io.Copy(wc, file)
 	if err != nil {
-		http.Error(w, "Failed to create file on disk", http.StatusInternalServerError)
+		wc.Close()
+		http.Error(w, "Failed to upload file to storage", http.StatusInternalServerError)
 		return
 	}
-	defer dst.Close()
 
-	// Copy the uploaded file to the destination file
-	_, err = io.Copy(dst, file)
-	if err != nil {
-		http.Error(w, "Failed to save file", http.StatusInternalServerError)
+	// Close the writer to finalize the upload
+	if err := wc.Close(); err != nil {
+		http.Error(w, "Failed to finalize upload", http.StatusInternalServerError)
 		return
 	}
 
@@ -124,10 +173,11 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{
 		"success": true,
-		"message": "File uploaded successfully",
+		"message": "File uploaded successfully to cloud storage",
 		"filename": "%s",
+		"bucket": "%s",
 		"size": %d
-	}`, filename, handler.Size)
+	}`, filename, bucketName, handler.Size)
 
-	log.Printf("File uploaded successfully: %s (size: %d bytes)", filename, handler.Size)
+	log.Printf("File uploaded successfully to GCS: %s/%s (size: %d bytes)", bucketName, filename, handler.Size)
 }

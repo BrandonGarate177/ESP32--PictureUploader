@@ -57,7 +57,7 @@ func main() {
 
 	// Start server
 	fmt.Printf("Server starting on port %s\n", port)
-	fmt.Printf("Upload endpoint: https://image-upload-server-719756097849.us-central1.run.app/upload\n")
+	fmt.Printf("Upload endpoint available at: /upload\n")
 	fmt.Printf("Using storage bucket: %s\n", bucketName)
 
 	if err := http.ListenAndServe(port, nil); err != nil {
@@ -104,10 +104,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	// Get the file from the form
 	file, handler, err := r.FormFile("file")
 	if err != nil {
+		log.Printf("Failed to get file from form: %v", err)
 		http.Error(w, "Failed to get file from form", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
+
+	log.Printf("Received file: %s, Size: %d bytes", handler.Filename, handler.Size)
 
 	// Check if file is an image (basic check by extension)
 	ext := filepath.Ext(handler.Filename)
@@ -127,7 +130,48 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Generate unique filename with timestamp
 	timestamp := time.Now().Format("20060102_150405")
-	filename := fmt.Sprintf("%s_%s", timestamp, handler.Filename)
+	// Remove extension from original filename and add it back properly
+	baseName := strings.TrimSuffix(handler.Filename, ext)
+	filename := fmt.Sprintf("%s_%s%s", timestamp, baseName, ext)
+
+	// Read file data to validate JPEG and get proper content type
+	fileData, err := io.ReadAll(file)
+	if err != nil {
+		log.Printf("Failed to read file data: %v", err)
+		http.Error(w, "Failed to read file data", http.StatusInternalServerError)
+		return
+	}
+
+	log.Printf("Read %d bytes from file", len(fileData))
+
+	// Validate JPEG data if it's supposed to be a JPEG
+	if strings.ToLower(ext) == ".jpg" || strings.ToLower(ext) == ".jpeg" {
+		if len(fileData) < 4 {
+			log.Printf("File too small to be valid JPEG: %d bytes", len(fileData))
+			http.Error(w, "File too small to be valid JPEG", http.StatusBadRequest)
+			return
+		}
+
+		// Check JPEG magic bytes
+		if fileData[0] != 0xFF || fileData[1] != 0xD8 || fileData[2] != 0xFF {
+			log.Printf("Invalid JPEG header. Expected FF D8 FF, got %02X %02X %02X",
+				fileData[0], fileData[1], fileData[2])
+			http.Error(w, "Invalid JPEG file format", http.StatusBadRequest)
+			return
+		}
+
+		// Check for JPEG end marker
+		if len(fileData) >= 2 {
+			if fileData[len(fileData)-2] != 0xFF || fileData[len(fileData)-1] != 0xD9 {
+				log.Printf("WARNING: Missing JPEG end marker. Expected FF D9, got %02X %02X",
+					fileData[len(fileData)-2], fileData[len(fileData)-1])
+			}
+		}
+
+		log.Printf("✓ JPEG validation passed - SOI: %02X %02X %02X, EOI: %02X %02X",
+			fileData[0], fileData[1], fileData[2],
+			fileData[len(fileData)-2], fileData[len(fileData)-1])
+	}
 
 	// Upload to Google Cloud Storage
 	ctx := context.Background()
@@ -136,37 +180,49 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Create a writer to the GCS object
 	wc := obj.NewWriter(ctx)
-	wc.ContentType = handler.Header.Get("Content-Type")
-	if wc.ContentType == "" {
-		// Set content type based on file extension
-		switch strings.ToLower(ext) {
-		case ".jpg", ".jpeg":
-			wc.ContentType = "image/jpeg"
-		case ".png":
-			wc.ContentType = "image/png"
-		case ".gif":
-			wc.ContentType = "image/gif"
-		case ".bmp":
-			wc.ContentType = "image/bmp"
-		case ".webp":
-			wc.ContentType = "image/webp"
-		default:
-			wc.ContentType = "application/octet-stream"
-		}
+
+	// Set content type based on file extension (don't trust multipart headers)
+	switch strings.ToLower(ext) {
+	case ".jpg", ".jpeg":
+		wc.ContentType = "image/jpeg"
+	case ".png":
+		wc.ContentType = "image/png"
+	case ".gif":
+		wc.ContentType = "image/gif"
+	case ".bmp":
+		wc.ContentType = "image/bmp"
+	case ".webp":
+		wc.ContentType = "image/webp"
+	default:
+		wc.ContentType = "application/octet-stream"
 	}
 
-	// Copy the uploaded file to GCS
-	_, err = io.Copy(wc, file)
+	log.Printf("Setting GCS Content-Type: %s", wc.ContentType)
+
+	// Write the file data to GCS
+	bytesWritten, err := wc.Write(fileData)
 	if err != nil {
 		wc.Close()
+		log.Printf("Failed to write to GCS: %v", err)
 		http.Error(w, "Failed to upload file to storage", http.StatusInternalServerError)
 		return
 	}
 
+	log.Printf("Wrote %d bytes to GCS", bytesWritten)
+
 	// Close the writer to finalize the upload
 	if err := wc.Close(); err != nil {
+		log.Printf("Failed to close GCS writer: %v", err)
 		http.Error(w, "Failed to finalize upload", http.StatusInternalServerError)
 		return
+	}
+
+	log.Printf("✓ Successfully uploaded %s to GCS bucket %s", filename, bucketName)
+
+	// Make the object publicly readable
+	acl := obj.ACL()
+	if err := acl.Set(ctx, storage.AllUsers, storage.RoleReader); err != nil {
+		log.Printf("Warning: Failed to set public access for %s: %v", filename, err)
 	}
 
 	// Return success response

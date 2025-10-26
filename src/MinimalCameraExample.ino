@@ -13,6 +13,7 @@
 #include <WiFiMulti.h>
 #include <HTTPClient.h>
 #include "esp_camera.h"
+#include "esp_mac.h"
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
@@ -23,11 +24,17 @@
 #include "wifi_config.h"
 #include "server_config.h"
 
-// SD Card pins (adjust these based on your board's pinout)
-#define SD_CS_PIN 21
-#define SD_MOSI_PIN 19
-#define SD_MISO_PIN 18
-#define SD_SCK_PIN 5
+// SD Card pins - Option 4: Ultra-safe GPIO numbers
+// GPIO 38-41 are typically the safest on ESP32-S3
+#define SD_CS_PIN 38     // Option 4 CS pin (ultra-safe GPIO)
+#define SD_MOSI_PIN 39   // Option 4 MOSI pin  
+#define SD_MISO_PIN 40   // Option 4 MISO pin
+#define SD_SCK_PIN 41    // Option 4 SCK pin
+
+// Previous attempts that failed (commented out):
+// Option 2 - Failed: 14, 15, 16, 17 (hardware command failures)
+// Option 1 - Failed: 10, 11, 13, 12 (hardware command failures)  
+// Original - Failed: 21, 19, 18, 5 (I2C/camera conflicts, caused resets)
 
 
 void        startCameraServer();
@@ -39,20 +46,47 @@ String      ipAddress = "";
 bool        use_ap_mode = false;
 
 unsigned long lastCaptureTime = 0;
-const unsigned long captureInterval = 30000; // Capture every 30 seconds (adjust as needed)
+const unsigned long captureInterval = 5000; // Capture every 5 seconds (fast testing)
 int imageCounter = 0;
+
+// Upload tracking variables
+int uploadAttempts = 0;
+int uploadSuccesses = 0;
+int uploadFailures = 0;
+unsigned long totalUploadTime = 0;
+size_t totalBytesUploaded = 0;
+
+// SD card monitoring
+unsigned long lastSDListTime = 0;
+const unsigned long sdListInterval = 120000; // List SD contents every 2 minutes
 
 
 
 void setup()
 {
-
     Serial.begin(115200);
+    
+    // Add immediate startup message
+    Serial.println("=== ESP32 CAMERA BOOTING ===");
+    Serial.println("Serial communication initialized");
+    Serial.flush();
 
-    // Start while waiting for Serial monitoring
-    while (!Serial);
+    // Replace the blocking while (!Serial); with a timeout
+    unsigned long serialTimeout = millis() + 5000; // 5 second timeout
+    while (!Serial && millis() < serialTimeout) {
+        delay(100);
+    }
+    
+    if (Serial) {
+        Serial.println("Serial monitor connected within timeout");
+    } else {
+        Serial.println("Serial monitor timeout - continuing without monitor");
+    }
 
-    delay(3000);
+    delay(1000); // Reduced from 3000ms
+
+    Serial.println("Starting main initialization...");
+    Serial.flush();
 
     Serial.println();
 
@@ -60,32 +94,39 @@ void setup()
      *  step 1 : Initialize power chip,
      *  turn on camera power channel
     ***********************************/
+    Serial.println("Step 1: Initializing power management...");
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
-        Serial.println("Failed to initialize power.....");
-        while (1) {
-            delay(5000);
-        }
+        Serial.println("Failed to initialize power management");
+        Serial.println("This might be normal for some boards without AXP2101");
+        // Don't hang here - some boards might not have this chip
+        // while (1) { delay(5000); }
+    } else {
+        Serial.println("Power management initialized successfully");
     }
     // Set the working voltage of the camera, please do not modify the parameters
-    PMU.setALDO1Voltage(1800);  // CAM DVDD 1500~1800
-    PMU.enableALDO1();
-    PMU.setALDO2Voltage(2800);  // CAM DVDD 2500~2800
-    PMU.enableALDO2();
-    PMU.setALDO4Voltage(3000);  // CAM AVDD 2800~3000
-    PMU.enableALDO4();
+    if (Serial) {
+        PMU.setALDO1Voltage(1800);  // CAM DVDD 1500~1800
+        PMU.enableALDO1();
+        PMU.setALDO2Voltage(2800);  // CAM DVDD 2500~2800
+        PMU.enableALDO2();
+        PMU.setALDO4Voltage(3000);  // CAM AVDD 2800~3000
+        PMU.enableALDO4();
 
-    // TS Pin detection must be disable, otherwise it cannot be charged
-    PMU.disableTSPinMeasure();
-
+        // TS Pin detection must be disable, otherwise it cannot be charged
+        PMU.disableTSPinMeasure();
+        Serial.println("Power voltages configured");
+    }
 
     /*********************************
      * step 2 : start network
      * If using station mode, please change use_ap_mode to false,
      * and fill in your account password in wifiMulti
     ***********************************/
+    Serial.println("Step 2: Connecting to WiFi...");
  
 
     // Connect to WiFi using credentials from wifi_config.h
+    Serial.printf("Attempting to connect to: %s\n", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     
     Serial.print("Connecting to WiFi");
@@ -109,6 +150,7 @@ void setup()
     /*********************************
      *  step 3 : Initialize camera
     ***********************************/
+    Serial.println("Step 3: Initializing camera...");
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -157,12 +199,39 @@ void setup()
 #endif
     }
 
-    // camera init
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        Serial.printf("Camera init failed with error 0x%x Please check if the camera is connected well.", err);
-        while (1) {
-            delay(5000);
+    // Robust camera initialization with retry logic
+    Serial.println("Initializing camera with retry logic...");
+    esp_err_t err = ESP_FAIL;
+    int retry_count = 0;
+    const int max_retries = 3;
+    
+    while (err != ESP_OK && retry_count < max_retries) {
+        retry_count++;
+        Serial.printf("Camera init attempt %d/%d...\n", retry_count, max_retries);
+        
+        // Clean shutdown any previous camera instance
+        if (retry_count > 1) {
+            esp_camera_deinit();
+            delay(1000); // Allow hardware to reset
+        }
+        
+        err = esp_camera_init(&config);
+        
+        if (err != ESP_OK) {
+            Serial.printf("Camera init failed with error 0x%x", err);
+            if (retry_count < max_retries) {
+                Serial.println(" - retrying...");
+                delay(2000);
+            } else {
+                Serial.println(" - max retries reached!");
+                while (1) {
+                    delay(5000);
+                }
+            }
+        } else {
+            Serial.println("Camera initialized successfully!");
+            // Give sensor time to stabilize after init
+            delay(2000);
         }
     }
 
@@ -206,25 +275,52 @@ void setup()
     s->set_hmirror(s, 1);
 #endif
 
+    // Sensor stabilization - critical for preventing green screen
+    Serial.println("Stabilizing camera sensor...");
+    delay(2000); // Allow sensor to fully initialize
+    
+    // Warm up the sensor with a few dummy captures
+    Serial.println("Warming up sensor (dummy captures)...");
+    for (int i = 0; i < 3; i++) {
+        camera_fb_t *warm_fb = esp_camera_fb_get();
+        if (warm_fb) {
+            Serial.printf("Warmup capture %d: %dx%d, %d bytes\n", 
+                         i+1, warm_fb->width, warm_fb->height, warm_fb->len);
+            esp_camera_fb_return(warm_fb);
+        }
+        delay(500);
+    }
+    Serial.println("Camera sensor ready for capture!");
+
 
 
     /*********************************
      *  step 4 : Initialize SD Card
     ***********************************/
-    Serial.println("Initializing SD card...");
+    Serial.println("Step 4: Initializing SD card...");
+    Serial.println("Battery power is sufficient - attempting SD card initialization");
     
-    // Initialize SPI for SD card
+    // Initialize SPI for SD card with careful power management
+    Serial.println("Configuring SPI bus for SD card...");
     SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
     
+    // Add small delay for power stabilization
+    delay(100);
+    
+    Serial.println("Attempting SD card initialization...");
     if (!SD.begin(SD_CS_PIN)) {
         Serial.println("SD Card initialization failed!");
+        Serial.println("Possible causes:");
+        Serial.println("  • No SD card inserted");
+        Serial.println("  • SD card corrupted or incompatible");
+        Serial.println("  • Pin connections incorrect");
         Serial.println("Continuing without SD card support...");
     } else {
         uint8_t cardType = SD.cardType();
         if (cardType == CARD_NONE) {
             Serial.println("No SD card attached");
         } else {
-            Serial.println("SD card initialized successfully!");
+            Serial.println("✓ SD card initialized successfully!");
             Serial.printf("SD Card Type: %s\n", 
                 cardType == CARD_MMC ? "MMC" :
                 cardType == CARD_SD ? "SDSC" :
@@ -233,10 +329,22 @@ void setup()
             uint64_t cardSize = SD.cardSize() / (1024 * 1024);
             Serial.printf("SD Card Size: %lluMB\n", cardSize);
             
+            uint64_t usedBytes = SD.usedBytes();
+            uint64_t totalBytes = SD.totalBytes();
+            Serial.printf("Used Space: %.2f MB / %.2f MB (%.1f%%)\n", 
+                          usedBytes / (1024.0 * 1024.0), 
+                          totalBytes / (1024.0 * 1024.0),
+                          (float)usedBytes / totalBytes * 100);
+            
             // Create images directory if it doesn't exist
             if (!SD.exists("/images")) {
-                SD.mkdir("/images");
-                Serial.println("Created /images directory");
+                if (SD.mkdir("/images")) {
+                    Serial.println("✓ Created /images directory");
+                } else {
+                    Serial.println("⚠ Failed to create /images directory");
+                }
+            } else {
+                Serial.println("✓ /images directory already exists");
             }
         }
     }
@@ -244,7 +352,11 @@ void setup()
     /*********************************
      *  step 5 : Camera ready for periodic capture
     ***********************************/
-    Serial.println("Camera initialized and ready for periodic image capture with SD storage");
+    Serial.println("=== INITIALIZATION COMPLETE ===");
+    Serial.printf("System ready at %s\n", getTimeString().c_str());
+    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    Serial.println("Will capture first image in 5 seconds...");
+    Serial.println("Camera ready for image capture every 5 seconds with SD card storage + cloud upload");
     // startCameraServer(); // Commented out - we're uploading images instead of serving them
 
 }
@@ -253,44 +365,132 @@ void loop()
 {
     unsigned long currentTime = millis();
     
+    // Add heartbeat every 10 seconds to verify system is alive
+    static unsigned long lastHeartbeat = 0;
+    if (currentTime - lastHeartbeat >= 10000) {
+        Serial.println("\n=== SYSTEM HEARTBEAT ===");
+        Serial.printf("Time: %s | Free heap: %d bytes\n", getTimeString().c_str(), ESP.getFreeHeap());
+        Serial.printf("Stats: Images captured: %d | Upload attempts: %d | Successes: %d\n", 
+                      imageCounter, uploadAttempts, uploadSuccesses);
+        
+        // Monitor battery and power status
+        printBatteryStatus();
+        
+        // Monitor WiFi connection
+        checkWiFiConnection();
+        
+        Serial.println("========================\n");
+        lastHeartbeat = currentTime;
+    }
+    
     // Check if it's time to capture an image
     if (currentTime - lastCaptureTime >= captureInterval) {
         captureAndProcessImage();
         lastCaptureTime = currentTime;
     }
     
+    // Check if it's time to print detailed statistics
+    if (currentTime - lastSDListTime >= sdListInterval) {
+        printDetailedSDCardInfo();
+        printUploadStatistics();
+        lastSDListTime = currentTime;
+    }
+    
     delay(100); // Short delay to prevent excessive CPU usage
 }
 
 void captureAndProcessImage() {
-    Serial.println("Capturing image...");
+    Serial.println("\n=== STARTING IMAGE CAPTURE #" + String(imageCounter + 1) + " ===");
+    Serial.printf("Capture Time: %s\n", getTimeString().c_str());
+    Serial.printf("Free Heap Before Capture: %d bytes\n", ESP.getFreeHeap());
     
-    // Take a picture
-    camera_fb_t *fb = esp_camera_fb_get();
+    // Take a picture with validation and retry logic
+    camera_fb_t *fb = nullptr;
+    int capture_attempts = 0;
+    const int max_capture_attempts = 3;
+    
+    while (!fb && capture_attempts < max_capture_attempts) {
+        capture_attempts++;
+        Serial.printf("Camera capture attempt %d/%d...\n", capture_attempts, max_capture_attempts);
+        
+        fb = esp_camera_fb_get();
+        
+        if (!fb) {
+            Serial.printf("Camera capture failed on attempt %d\n", capture_attempts);
+            if (capture_attempts < max_capture_attempts) {
+                delay(500); // Wait before retry
+            }
+            continue;
+        }
+        
+        // Validate frame buffer data
+        bool valid_frame = true;
+        
+        // Check for minimum size (avoid green screen frames)
+        if (fb->len < 1000) {
+            Serial.printf("Frame too small (%d bytes) - likely corrupted\n", fb->len);
+            valid_frame = false;
+        }
+        
+        // Check for JPEG header if format is JPEG
+        if (fb->format == PIXFORMAT_JPEG && fb->len > 10) {
+            if (fb->buf[0] != 0xFF || fb->buf[1] != 0xD8) {
+                Serial.println("Invalid JPEG header - corrupted frame");
+                valid_frame = false;
+            }
+        }
+        
+        // Check for all-zero or near-zero data (green screen indicator)
+        if (valid_frame && fb->len > 100) {
+            int zero_count = 0;
+            for (int i = 0; i < 100; i++) {
+                if (fb->buf[i] == 0x00) zero_count++;
+            }
+            if (zero_count > 80) {
+                Serial.println("Frame appears to be mostly zeros - likely green screen");
+                valid_frame = false;
+            }
+        }
+        
+        if (!valid_frame) {
+            Serial.println("Invalid frame detected, releasing and retrying...");
+            esp_camera_fb_return(fb);
+            fb = nullptr;
+            if (capture_attempts < max_capture_attempts) {
+                delay(1000); // Longer wait for corrupted frames
+            }
+        }
+    }
+    
     if (!fb) {
-        Serial.println("Camera capture failed");
+        Serial.println("All camera capture attempts failed!");
         return;
     }
     
-    Serial.printf("Image captured! Size: %d bytes, Width: %d, Height: %d\n", 
-                  fb->len, fb->width, fb->height);
+    Serial.printf("✓ Valid image captured successfully!\n");
+    Serial.printf("Dimensions: %d x %d pixels\n", fb->width, fb->height);
+    Serial.printf("Size: %d bytes (%.2f KB)\n", fb->len, fb->len / 1024.0);
+    Serial.printf("Format: %s\n", fb->format == PIXFORMAT_JPEG ? "JPEG" : "Other");
     
     // Generate filename with timestamp
-    String filename = "/images/img_" + String(imageCounter) + "_" + String(millis()) + ".jpg";
+    String filename = "/images/img_" + String(imageCounter + 1) + "_" + String(millis()) + ".jpg";
+    Serial.printf("Generated filename: %s\n", filename.c_str());
     
-    // Save to SD card first
+    // Try to save to SD card first, fallback to direct upload if SD fails
     bool savedToSD = saveImageToSD(fb->buf, fb->len, filename);
     
     if (savedToSD) {
-        Serial.println("Image saved to SD card successfully!");
+        Serial.println("✓ Image saved to SD card successfully!");
         
-        // Print SD card contents
-        printSDCardContents();
-        
-        // Upload from SD card to server
+        // Upload from SD card to server (provides backup if upload fails)
         uploadImageFromSD(filename);
+        
+        // Optionally print SD card contents periodically (every 10th image)
+        if (imageCounter % 10 == 0) {
+            printSDCardContents();
+        }
     } else {
-        Serial.println("Failed to save to SD card, uploading directly from memory...");
+        Serial.println("⚠ Failed to save to SD card, uploading directly from memory...");
         // Fallback: upload directly from memory
         uploadImageToServer(fb->buf, fb->len);
     }
@@ -382,8 +582,111 @@ void printDirectory(File dir, int numTabs) {
     }
 }
 
+// Get formatted time string for logging
+String getTimeString() {
+    unsigned long currentMillis = millis();
+    unsigned long seconds = currentMillis / 1000;
+    unsigned long minutes = seconds / 60;
+    unsigned long hours = minutes / 60;
+    
+    seconds = seconds % 60;
+    minutes = minutes % 60;
+    hours = hours % 24;
+    
+    char timeStr[20];
+    sprintf(timeStr, "%02lu:%02lu:%02lu.%03lu", hours, minutes, seconds, currentMillis % 1000);
+    return String(timeStr);
+}
+
+// Enhanced SD card information with detailed file listing
+void printDetailedSDCardInfo() {
+    Serial.println("\n=== PERIODIC SD CARD REPORT ===");
+    Serial.printf("Scan Time: %s\n", getTimeString().c_str());
+    
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD card not available");
+        return;
+    }
+    
+    // Get card information
+    uint8_t cardType = SD.cardType();
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    uint64_t usedBytes = SD.usedBytes();
+    uint64_t totalBytes = SD.totalBytes();
+    
+    Serial.printf("Card Type: %s\n", 
+                  cardType == CARD_MMC ? "MMC" :
+                  cardType == CARD_SD ? "SDSC" :
+                  cardType == CARD_SDHC ? "SDHC" : "UNKNOWN");
+    Serial.printf("Card Size: %llu MB\n", cardSize);
+    Serial.printf("Used Space: %.2f MB / %.2f MB (%.1f%%)\n", 
+                  usedBytes / (1024.0 * 1024.0), 
+                  totalBytes / (1024.0 * 1024.0),
+                  (float)usedBytes / totalBytes * 100);
+    
+    // List all files in images directory with details
+    Serial.println("\n=== IMAGES DIRECTORY CONTENTS ===");
+    File imagesDir = SD.open("/images");
+    if (imagesDir) {
+        int fileCount = 0;
+        size_t totalImageSize = 0;
+        
+        while (true) {
+            File entry = imagesDir.openNextFile();
+            if (!entry) break;
+            
+            if (!entry.isDirectory()) {
+                fileCount++;
+                totalImageSize += entry.size();
+                
+                Serial.printf("[%d] %s - %.2f KB\n", 
+                             fileCount, entry.name(), entry.size() / 1024.0);
+            }
+            entry.close();
+        }
+        
+        imagesDir.close();
+        
+        Serial.printf("\nImages Summary:\n");
+        Serial.printf("   Total Files: %d\n", fileCount);
+        Serial.printf("   Total Size: %.2f MB\n", totalImageSize / (1024.0 * 1024.0));
+        if (fileCount > 0) {
+            Serial.printf("   Average Size: %.2f KB per file\n", (totalImageSize / 1024.0) / fileCount);
+        }
+    } else {
+        Serial.println("Images directory not found or cannot be opened");
+    }
+    
+    Serial.println("===============================\n");
+}
+
+// Print upload statistics
+void printUploadStatistics() {
+    Serial.println("=== UPLOAD STATISTICS ===");
+    Serial.printf("Total Attempts: %d\n", uploadAttempts);
+    Serial.printf("Successes: %d\n", uploadSuccesses);
+    Serial.printf("Failures: %d\n", uploadFailures);
+
+    if (uploadAttempts > 0) {
+        float successRate = (float)uploadSuccesses / uploadAttempts * 100;
+        Serial.printf("Success Rate: %.1f%%\n", successRate);
+
+        if (uploadSuccesses > 0) {
+            float avgUploadTime = (float)totalUploadTime / uploadSuccesses;
+            float avgFileSize = (float)totalBytesUploaded / uploadSuccesses / 1024.0;
+            Serial.printf("Average Upload Time: %.1f ms\n", avgUploadTime);
+            Serial.printf("Average File Size: %.2f KB\n", avgFileSize);
+            Serial.printf("Total Data Uploaded: %.2f MB\n", totalBytesUploaded / (1024.0 * 1024.0));
+        }
+    }
+
+    Serial.printf("Current Free Heap: %d bytes (%.2f KB)\n", 
+                  ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
+    Serial.println("============================\n");
+}
+
 void uploadImageFromSD(String filename) {
-    Serial.printf("Uploading image from SD: %s\n", filename.c_str());
+    Serial.printf("Starting upload from SD card: %s\n", filename.c_str());
     
     if (!SD.begin(SD_CS_PIN)) {
         Serial.println("SD card not available for upload");
@@ -428,13 +731,53 @@ void uploadImageFromSD(String filename) {
     Serial.printf("Upload from SD card completed for: %s\n", filename.c_str());
 }
 
+// Validate JPEG image data integrity
+bool validateJPEGData(uint8_t* imageData, size_t imageSize) {
+    if (!imageData || imageSize < 4) {
+        Serial.println("ERROR: Invalid image data or size too small");
+        return false;
+    }
+    
+    // Check JPEG magic bytes (SOI - Start of Image)
+    if (imageData[0] != 0xFF || imageData[1] != 0xD8 || imageData[2] != 0xFF) {
+        Serial.printf("ERROR: Invalid JPEG header. Expected FF D8 FF, got %02X %02X %02X\n", 
+                     imageData[0], imageData[1], imageData[2]);
+        return false;
+    }
+    
+    // Check for JPEG end marker (EOI - End of Image)
+    if (imageSize >= 2) {
+        if (imageData[imageSize-2] != 0xFF || imageData[imageSize-1] != 0xD9) {
+            Serial.printf("WARNING: Missing JPEG end marker. Expected FF D9, got %02X %02X\n", 
+                         imageData[imageSize-2], imageData[imageSize-1]);
+            // Don't fail here as some cameras might not add proper EOI
+        }
+    }
+    
+    Serial.printf("✓ JPEG validation passed - SOI: %02X %02X %02X, EOI: %02X %02X\n",
+                 imageData[0], imageData[1], imageData[2], 
+                 imageData[imageSize-2], imageData[imageSize-1]);
+    return true;
+}
+
 // Upload image to server via HTTP POST with multipart form data
 void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
-    Serial.println("=== STARTING IMAGE UPLOAD DEBUG ===");
-    Serial.printf("WiFi Status: %d (3=Connected)\n", WiFi.status());
-    Serial.printf("Image data pointer: %p\n", imageData);
-    Serial.printf("Image size: %d bytes\n", imageSize);
+    // Track upload start time
+    unsigned long uploadStartTime = millis();
+    uploadAttempts++;
     
+    // Create detailed timestamp
+    String timestamp = getTimeString();
+
+    Serial.println("\n=== STARTING IMAGE UPLOAD #" + String(uploadAttempts) + " ===");
+    Serial.printf("Upload Start Time: %s\n", timestamp.c_str());
+    Serial.printf("Upload Statistics - Attempts: %d | Successes: %d | Failures: %d\n", 
+                  uploadAttempts, uploadSuccesses, uploadFailures);
+    Serial.printf("WiFi Status: %d (3=Connected)\n", WiFi.status());
+    Serial.printf("Image Counter: #%d\n", imageCounter);
+    Serial.printf("Image Size: %d bytes (%.2f KB)\n", imageSize, imageSize / 1024.0);
+    Serial.printf("Free Heap: %d bytes (%.2f KB)\n", ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
+
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi not connected, skipping upload");
         return;
@@ -442,6 +785,14 @@ void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
     
     if (!imageData || imageSize == 0) {
         Serial.println("Invalid image data or size");
+        uploadFailures++;
+        return;
+    }
+    
+    // Validate JPEG data integrity before uploading
+    if (!validateJPEGData(imageData, imageSize)) {
+        Serial.println("JPEG validation failed - skipping upload");
+        uploadFailures++;
         return;
     }
     
@@ -520,8 +871,24 @@ void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
     Serial.printf("  - Footer size: %d bytes\n", footer.length());
     
     // Print first few bytes of payload for verification
-    Serial.print("First 20 bytes of payload: ");
+    Serial.print("First 20 bytes of payload (multipart headers): ");
     for (int i = 0; i < 20 && i < totalSize; i++) {
+        Serial.printf("%02X ", payload[i]);
+    }
+    Serial.println();
+    
+    // Print first few bytes of actual image data (skip multipart header)
+    size_t imageStart = header.length();
+    Serial.printf("First 10 bytes of image data (at offset %d): ", imageStart);
+    for (int i = 0; i < 10 && (imageStart + i) < totalSize; i++) {
+        Serial.printf("%02X ", payload[imageStart + i]);
+    }
+    Serial.println();
+    
+    // Print last few bytes of image data (before footer)
+    size_t imageEnd = header.length() + imageSize;
+    Serial.printf("Last 10 bytes of image data (at offset %d): ", imageEnd - 10);
+    for (int i = imageEnd - 10; i < imageEnd && i < totalSize; i++) {
         Serial.printf("%02X ", payload[i]);
     }
     Serial.println();
@@ -538,11 +905,23 @@ void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
     
     Serial.printf("Response code received: %d\n", httpResponseCode);
     
+    // Calculate upload duration
+    unsigned long uploadDuration = millis() - uploadStartTime;
+    totalUploadTime += uploadDuration;
+    
     // Handle response
     if (httpResponseCode >= 200 && httpResponseCode < 300) {
+        uploadSuccesses++;
+        totalBytesUploaded += imageSize;
+        
         String response = http.getString();
-        Serial.printf("Upload successful! Response code: %d\n", httpResponseCode);
-        Serial.printf("Server response: %s\n", response.c_str());
+        Serial.println("\n=== UPLOAD SUCCESSFUL ===");
+        Serial.printf("Success! Response Code: %d\n", httpResponseCode);
+        Serial.printf("Upload Duration: %lu ms\n", uploadDuration);
+        Serial.printf("Upload Speed: %.2f KB/s\n", (imageSize / 1024.0) / (uploadDuration / 1000.0));
+        Serial.printf("Server Response: %s\n", response.c_str());
+        Serial.printf("Total Success Rate: %.1f%% (%d/%d)\n", 
+                      (float)uploadSuccesses / uploadAttempts * 100, uploadSuccesses, uploadAttempts);
     } else if (httpResponseCode >= 300 && httpResponseCode < 400) {
         Serial.printf("Redirect detected (code: %d)\n", httpResponseCode);
         String location = http.header("Location");
@@ -561,20 +940,30 @@ void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
             Serial.printf("Response body: %s\n", response.c_str());
         }
     } else if (httpResponseCode <= 0) {
-        Serial.printf("HTTP Connection failed! Error code: %d\n", httpResponseCode);
-        Serial.printf("Error description: %s\n", http.errorToString(httpResponseCode).c_str());
+        uploadFailures++;
+        Serial.println("\n=== UPLOAD FAILED - CONNECTION ERROR ===");
+        Serial.printf("Connection Error Code: %d\n", httpResponseCode);
+        Serial.printf("Failed After: %lu ms\n", uploadDuration);
+        Serial.printf("Error Description: %s\n", http.errorToString(httpResponseCode).c_str());
+        Serial.printf("Total Failure Rate: %.1f%% (%d/%d)\n", 
+                      (float)uploadFailures / uploadAttempts * 100, uploadFailures, uploadAttempts);
         Serial.println("Possible causes:");
-        Serial.println("  - ngrok tunnel is down");
-        Serial.println("  - WiFi connection unstable");
-        Serial.println("  - DNS resolution failed");
-        Serial.println("  - Server not responding");
+        Serial.println("   - ngrok tunnel is down");
+        Serial.println("   - WiFi connection unstable");
+        Serial.println("   - DNS resolution failed");
+        Serial.println("   - Server not responding");
     } else {
-        Serial.printf("Upload failed! HTTP Error code: %d\n", httpResponseCode);
-        Serial.printf("Error description: %s\n", http.errorToString(httpResponseCode).c_str());
+        uploadFailures++;
+        Serial.println("\n=== UPLOAD FAILED - HTTP ERROR ===");
+        Serial.printf("HTTP Error Code: %d\n", httpResponseCode);
+        Serial.printf("Failed After: %lu ms\n", uploadDuration);
+        Serial.printf("Error Description: %s\n", http.errorToString(httpResponseCode).c_str());
         String response = http.getString();
         if (response.length() > 0) {
-            Serial.printf("Error response: %s\n", response.c_str());
+            Serial.printf("Error Response: %s\n", response.c_str());
         }
+        Serial.printf("Total Failure Rate: %.1f%% (%d/%d)\n", 
+                      (float)uploadFailures / uploadAttempts * 100, uploadFailures, uploadAttempts);
         
         // Additional debugging info
         Serial.printf("Connected to host: %s\n", http.connected() ? "Yes" : "No");
@@ -582,7 +971,53 @@ void uploadImageToServer(uint8_t* imageData, size_t imageSize) {
     }
     
     http.end();
+
+    Serial.printf("Free Heap After: %d bytes (%.2f KB)\n", ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
+    Serial.println("=== UPLOAD COMPLETE ===\n");
+}
+
+// Battery monitoring function with correct AXP2101 methods
+void printBatteryStatus() {
+    if (PMU.isBatteryConnect()) {
+        Serial.printf("Battery connected: YES\n");
+        Serial.printf("Battery voltage: %.2f V\n", PMU.getBattVoltage() / 1000.0);
+        Serial.printf("Battery charging: %s\n", PMU.isCharging() ? "YES" : "NO");
+        
+        // Get system voltage instead of discharge current
+        Serial.printf("System voltage: %.2f V\n", PMU.getSystemVoltage() / 1000.0);
+        Serial.printf("VBUS voltage: %.2f V\n", PMU.getVbusVoltage() / 1000.0);
+        Serial.printf("VBUS present: %s\n", PMU.isVbusIn() ? "YES" : "NO");
+    } else {
+        Serial.println("Battery connected: NO");
+        Serial.printf("VBUS present: %s\n", PMU.isVbusIn() ? "YES (USB Power)" : "NO");
+    }
+}
+
+// WiFi connection monitoring and auto-reconnect
+void checkWiFiConnection() {
+    wl_status_t status = WiFi.status();
+    Serial.printf("WiFi Status: %d ", status);
     
-    Serial.printf("Free heap after HTTP: %d bytes\n", ESP.getFreeHeap());
-    Serial.println("=== UPLOAD DEBUG COMPLETE ===\n");
+    switch(status) {
+        case WL_CONNECTED:
+            Serial.printf("(CONNECTED) - IP: %s, RSSI: %d dBm\n", 
+                         WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            break;
+        case WL_NO_SSID_AVAIL:
+            Serial.println("(NO SSID AVAILABLE)");
+            break;
+        case WL_CONNECT_FAILED:
+            Serial.println("(CONNECTION FAILED)");
+            break;
+        case WL_DISCONNECTED:
+            Serial.println("(DISCONNECTED)");
+            break;
+        default:
+            Serial.printf("(OTHER: %d)\n", status);
+    }
+    
+    if (status != WL_CONNECTED) {
+        Serial.println("Attempting to reconnect WiFi...");
+        WiFi.reconnect();
+    }
 }

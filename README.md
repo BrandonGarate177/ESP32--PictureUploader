@@ -6,13 +6,11 @@ A complete IoT camera system using ESP32-S3 with OV5640 camera module that autom
 
 ```
 ┌─────────────────┐    WiFi/HTTP     ┌─────────────────┐    File I/O    ┌─────────────────┐
-│   ESP32-S3      │ ───────────────> │   Go Server     │ ─────────────> │  Local Storage  │
-│  + OV5640       │   (Image Upload) │                 │   (Save Images)│    (uploads/)   │
+│   ESP32-S3      │ ───────────────> │   Go Server     │ ─────────────> │   GCS Storage   │
+│  + OV5640       │   (Image Upload) │                 │   (Save Images)│    (bucket)     │
 │  + XPowers PMU  │                  │                 │                │                 │
 └─────────────────┘                  └─────────────────┘                └─────────────────┘
 ```
-
-I hosted the project using [NGROK](https://ngrok.com/) for this development project. 
 
 ##  Project Overview
 
@@ -242,30 +240,17 @@ uploads/
 
 ## Troubleshooting
 
-### Issues I Experienced
+### Current Issues. 
 
-1. **Camera Initialization Failed:**
-   - Check camera module connections
-   - Verify power supply stability
-   - Ensure PSRAM is available
+When the board is initialized while connected to computer the images appear clear, however when turned on with no connection to computer the images appear corrupted. This is likely due to an inproper startup/reboot sequence. 
 
-2. **WiFi Connection Problems:**
-   - Verify WiFi credentials in `wifi_config.h`
-   - Check network signal strength
-   - Ensure 2.4GHz network (ESP32 doesn't support 5GHz)
 
-3. **Upload Failures:**
-   - Verify server is running and accessible
-   - Check firewall settings
-   - Validate ngrok tunnel if using remote access
-   - Monitor memory usage during upload
+<img width="635" height="470" alt="Screenshot 2025-10-26 at 4 09 51 PM" src="https://github.com/user-attachments/assets/0719cf03-1252-4205-8861-694c4cdeb7fb" />
+<img width="1278" height="950" alt="image" src="https://github.com/user-attachments/assets/42385e88-8ce9-4e43-847c-7e3564885128" />
 
-4. **Image Quality Issues:**
-   - Adjust JPEG quality setting
-   - Modify frame size for better performance
-   - Check camera lens focus and cleanliness
 
 ### Debug Information
+
 
 Enable verbose debugging by checking serial monitor output. The ESP32 provides comprehensive logging for:
 - Memory allocation status

@@ -16,30 +16,47 @@
 #include "esp_mac.h"
 #include "FS.h"
 #include "SD.h"
+#include "SD_MMC.h"
 #include "SPI.h"
 
-#define XPOWERS_CHIP_AXP2101
-#include "XPowersLib.h"
+#include <XPowersLib.h>
+#include <ArduinoJson.h>
 #include "utilities.h"
 #include "wifi_config.h"
 #include "server_config.h"
 
-// SD Card pins - Option 4: Ultra-safe GPIO numbers
-// GPIO 38-41 are typically the safest on ESP32-S3
-#define SD_CS_PIN 38     // Option 4 CS pin (ultra-safe GPIO)
-#define SD_MOSI_PIN 39   // Option 4 MOSI pin  
-#define SD_MISO_PIN 40   // Option 4 MISO pin
-#define SD_SCK_PIN 41    // Option 4 SCK pin
+// LilyGo T-Camera S3 SIM7080G Pin Configuration (from utilities.h)
+// Camera pins - MUST match LILYGO_ESP32S3_CAM_SIM7080G configuration
+#define CAM_PWDN_PIN     -1
+#define CAM_RESET_PIN    18   // RESET_GPIO_NUM
+#define CAM_XCLK_PIN     8    // XCLK_GPIO_NUM - CORRECTED from 14 to 8
+#define CAM_SIOD_PIN     2    // SIOD_GPIO_NUM - CORRECTED from 4 to 2 (I2C SDA)
+#define CAM_SIOC_PIN     1    // SIOC_GPIO_NUM - CORRECTED from 5 to 1 (I2C SCL)
+#define CAM_Y9_PIN       9    // Y9_GPIO_NUM - Data pin 7 (MSB)
+#define CAM_Y8_PIN       10   // Y8_GPIO_NUM - Data pin 6
+#define CAM_Y7_PIN       11   // Y7_GPIO_NUM - Data pin 5
+#define CAM_Y6_PIN       13   // Y6_GPIO_NUM - Data pin 4
+#define CAM_Y5_PIN       21   // Y5_GPIO_NUM - Data pin 3
+#define CAM_Y4_PIN       48   // Y4_GPIO_NUM - Data pin 2
+#define CAM_Y3_PIN       47   // Y3_GPIO_NUM - Data pin 1
+#define CAM_Y2_PIN       14   // Y2_GPIO_NUM - Data pin 0 (LSB)
+#define CAM_VSYNC_PIN    16   // VSYNC_GPIO_NUM - Vertical sync
+#define CAM_HREF_PIN     17   // HREF_GPIO_NUM - Horizontal reference
+#define CAM_PCLK_PIN     12   // PCLK_GPIO_NUM - Pixel clock
 
-// Previous attempts that failed (commented out):
-// Option 2 - Failed: 14, 15, 16, 17 (hardware command failures)
-// Option 1 - Failed: 10, 11, 13, 12 (hardware command failures)  
-// Original - Failed: 21, 19, 18, 5 (I2C/camera conflicts, caused resets)
+// SD Card pins - LilyGo T-Camera S3 SIM7080G SDMMC Configuration
+// Using SDMMC interface (not SPI) as defined in utilities.h
+#define SDMMC_CMD_PIN  39   // SDMMC_CMD from utilities.h
+#define SDMMC_CLK_PIN  38   // SDMMC_CLK from utilities.h  
+#define SDMMC_DATA_PIN 40   // SDMMC_DATA from utilities.h
+
+// Note: This board uses SDMMC interface, not SPI
+// Previous SPI attempts failed because this board doesn't use SPI for SD card
 
 
 void        startCameraServer();
 
-XPowersPMU  PMU;
+XPowersAXP2101  PMU;
 WiFiMulti   wifiMulti;
 String      hostName = "LilyGo-Cam-";
 String      ipAddress = "";
@@ -59,6 +76,10 @@ size_t totalBytesUploaded = 0;
 // SD card monitoring
 unsigned long lastSDListTime = 0;
 const unsigned long sdListInterval = 120000; // List SD contents every 2 minutes
+
+// SD card interface tracking
+bool sdCardAvailable = false;
+bool usingSDMMC = false;
 
 
 
@@ -131,7 +152,7 @@ void setup()
     
     Serial.print("Connecting to WiFi");
     while (WiFi.status() != WL_CONNECTED) {
-        delay(1000);
+        delay(500);
         Serial.print(".");
     }
     
@@ -154,22 +175,23 @@ void setup()
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
-    config.pin_d0 = Y2_GPIO_NUM;
-    config.pin_d1 = Y3_GPIO_NUM;
-    config.pin_d2 = Y4_GPIO_NUM;
-    config.pin_d3 = Y5_GPIO_NUM;
-    config.pin_d4 = Y6_GPIO_NUM;
-    config.pin_d5 = Y7_GPIO_NUM;
-    config.pin_d6 = Y8_GPIO_NUM;
-    config.pin_d7 = Y9_GPIO_NUM;
-    config.pin_xclk = XCLK_GPIO_NUM;
-    config.pin_pclk = PCLK_GPIO_NUM;
-    config.pin_vsync = VSYNC_GPIO_NUM;
-    config.pin_href = HREF_GPIO_NUM;
-    config.pin_sccb_sda = SIOD_GPIO_NUM;
-    config.pin_sccb_scl = SIOC_GPIO_NUM;
-    config.pin_pwdn = PWDN_GPIO_NUM;
-    config.pin_reset = RESET_GPIO_NUM;
+    // Use T-SIMCAM pin configuration for maximum compatibility
+    config.pin_d0 = CAM_Y2_PIN;    // GPIO 11
+    config.pin_d1 = CAM_Y3_PIN;    // GPIO 9  
+    config.pin_d2 = CAM_Y4_PIN;    // GPIO 8
+    config.pin_d3 = CAM_Y5_PIN;    // GPIO 10
+    config.pin_d4 = CAM_Y6_PIN;    // GPIO 12
+    config.pin_d5 = CAM_Y7_PIN;    // GPIO 17
+    config.pin_d6 = CAM_Y8_PIN;    // GPIO 16
+    config.pin_d7 = CAM_Y9_PIN;    // GPIO 15
+    config.pin_xclk = CAM_XCLK_PIN;     // GPIO 14
+    config.pin_pclk = CAM_PCLK_PIN;     // GPIO 13
+    config.pin_vsync = CAM_VSYNC_PIN;   // GPIO 6
+    config.pin_href = CAM_HREF_PIN;     // GPIO 7
+    config.pin_sccb_sda = CAM_SIOD_PIN; // GPIO 4 (I2C SDA)
+    config.pin_sccb_scl = CAM_SIOC_PIN; // GPIO 5 (I2C SCL)
+    config.pin_pwdn = CAM_PWDN_PIN;     // -1 (not used)
+    config.pin_reset = CAM_RESET_PIN;   // GPIO 18
     config.xclk_freq_hz = 20000000; // 20MHz works well for OV5640
     config.frame_size = FRAMESIZE_SVGA; // Start with reasonable size for OV5640 streaming (800x600)
     config.pixel_format = PIXFORMAT_JPEG; // for streaming
@@ -300,51 +322,117 @@ void setup()
     Serial.println("Step 4: Initializing SD card...");
     Serial.println("Battery power is sufficient - attempting SD card initialization");
     
-    // Initialize SPI for SD card with careful power management
-    Serial.println("Configuring SPI bus for SD card...");
-    SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+    // Try SDMMC first (1-bit mode), then fallback to SPI if needed
+    Serial.println("Attempting SDMMC 1-bit mode initialization...");
+    Serial.printf("SDMMC pins - CMD: %d, CLK: %d, DATA0: %d\n", SDMMC_CMD_PIN, SDMMC_CLK_PIN, SDMMC_DATA_PIN);
     
     // Add small delay for power stabilization
     delay(100);
     
-    Serial.println("Attempting SD card initialization...");
-    if (!SD.begin(SD_CS_PIN)) {
-        Serial.println("SD Card initialization failed!");
-        Serial.println("Possible causes:");
-        Serial.println("  • No SD card inserted");
-        Serial.println("  • SD card corrupted or incompatible");
-        Serial.println("  • Pin connections incorrect");
-        Serial.println("Continuing without SD card support...");
+    // Try SDMMC with 1-bit mode (only DATA0 line)
+    bool sdCardWorking = false;
+    if (!SD_MMC.begin("/sdcard", true)) {  // true = 1-bit mode
+        Serial.println("SDMMC initialization failed, trying SPI mode...");
+        
+        // Fallback to SPI mode - try different pin combinations
+        // Based on common ESP32-S3 configurations
+        Serial.println("Attempting SPI mode with alternative pins...");
+        
+        // Try configuration 1: Common ESP32-S3 SPI pins
+        SPI.begin(39, 40, 38, -1);  // SCK, MISO, MOSI, SS (no SS for SD)
+        if (SD.begin(47, SPI, 40000000)) {  // CS=47, high speed
+            Serial.println("✓ SD card initialized via SPI (pins: CS=47, SCK=39, MISO=40, MOSI=38)");
+            sdCardWorking = true;
+        } else {
+            Serial.println("SPI attempt 1 failed, trying alternative pins...");
+            
+            // Try configuration 2: Alternative pins
+            SPI.end();
+            SPI.begin(38, 40, 39, -1);  // Different pin arrangement
+            if (SD.begin(21, SPI, 40000000)) {  // CS=21
+                Serial.println("✓ SD card initialized via SPI (pins: CS=21, SCK=38, MISO=40, MOSI=39)");
+                sdCardWorking = true;
+            } else {
+                Serial.println("All SD card initialization attempts failed!");
+                Serial.println("Possible causes:");
+                Serial.println("  • No SD card inserted");
+                Serial.println("  • SD card corrupted or incompatible");
+                Serial.println("  • Pin connections incorrect for both SDMMC and SPI");
+                Serial.println("Continuing without SD card support...");
+            }
+        }
     } else {
-        uint8_t cardType = SD.cardType();
+        Serial.println("✓ SD card initialized via SDMMC 1-bit mode!");
+        sdCardWorking = true;
+    }
+    
+    if (sdCardWorking) {
+        // Try to get card info - check which interface worked
+        uint8_t cardType = CARD_NONE;
+        uint64_t cardSize = 0;
+        uint64_t usedBytes = 0;
+        uint64_t totalBytes = 0;
+        bool usingSDMMC = false;
+        
+        // Check if SD_MMC is working
+        cardType = SD_MMC.cardType();
+        if (cardType != CARD_NONE) {
+            usingSDMMC = true;
+            sdCardAvailable = true;
+            cardSize = SD_MMC.cardSize() / (1024 * 1024);
+            usedBytes = SD_MMC.usedBytes();
+            totalBytes = SD_MMC.totalBytes();
+        } else {
+            // Must be using SPI mode
+            cardType = SD.cardType();
+            if (cardType != CARD_NONE) {
+                usingSDMMC = false;
+                sdCardAvailable = true;
+                cardSize = SD.cardSize() / (1024 * 1024);
+                usedBytes = SD.usedBytes();
+                totalBytes = SD.totalBytes();
+            }
+        }
+        
         if (cardType == CARD_NONE) {
             Serial.println("No SD card attached");
         } else {
-            Serial.println("✓ SD card initialized successfully!");
+            Serial.printf("✓ SD card working via %s interface!\n", usingSDMMC ? "SDMMC" : "SPI");
             Serial.printf("SD Card Type: %s\n", 
                 cardType == CARD_MMC ? "MMC" :
                 cardType == CARD_SD ? "SDSC" :
                 cardType == CARD_SDHC ? "SDHC" : "UNKNOWN");
             
-            uint64_t cardSize = SD.cardSize() / (1024 * 1024);
             Serial.printf("SD Card Size: %lluMB\n", cardSize);
-            
-            uint64_t usedBytes = SD.usedBytes();
-            uint64_t totalBytes = SD.totalBytes();
             Serial.printf("Used Space: %.2f MB / %.2f MB (%.1f%%)\n", 
                           usedBytes / (1024.0 * 1024.0), 
                           totalBytes / (1024.0 * 1024.0),
                           (float)usedBytes / totalBytes * 100);
             
             // Create images directory if it doesn't exist
-            if (!SD.exists("/images")) {
-                if (SD.mkdir("/images")) {
-                    Serial.println("✓ Created /images directory");
+            bool imagesDirExists = false;
+            if (usingSDMMC) {
+                imagesDirExists = SD_MMC.exists("/images");
+                if (!imagesDirExists) {
+                    if (SD_MMC.mkdir("/images")) {
+                        Serial.println("✓ Created /images directory");
+                    } else {
+                        Serial.println("⚠ Failed to create /images directory");
+                    }
                 } else {
-                    Serial.println("⚠ Failed to create /images directory");
+                    Serial.println("✓ /images directory already exists");
                 }
             } else {
-                Serial.println("✓ /images directory already exists");
+                imagesDirExists = SD.exists("/images");
+                if (!imagesDirExists) {
+                    if (SD.mkdir("/images")) {
+                        Serial.println("✓ Created /images directory");
+                    } else {
+                        Serial.println("⚠ Failed to create /images directory");
+                    }
+                } else {
+                    Serial.println("✓ /images directory already exists");
+                }
             }
         }
     }
@@ -413,12 +501,24 @@ void captureAndProcessImage() {
         capture_attempts++;
         Serial.printf("Camera capture attempt %d/%d...\n", capture_attempts, max_capture_attempts);
         
+        // Add sensor reset and stabilization for subsequent captures
+        if (capture_attempts > 1) {
+            Serial.println("Resetting camera sensor for retry...");
+            sensor_t *s = esp_camera_sensor_get();
+            if (s) {
+                // Reset sensor registers to ensure clean state
+                s->set_framesize(s, FRAMESIZE_VGA);
+                s->set_quality(s, 10);
+            }
+            delay(1000); // Longer delay for sensor reset
+        }
+        
         fb = esp_camera_fb_get();
         
         if (!fb) {
             Serial.printf("Camera capture failed on attempt %d\n", capture_attempts);
             if (capture_attempts < max_capture_attempts) {
-                delay(500); // Wait before retry
+                delay(capture_attempts * 500); // Progressive delay
             }
             continue;
         }
@@ -504,14 +604,20 @@ void captureAndProcessImage() {
 }
 
 bool saveImageToSD(uint8_t* imageData, size_t imageSize, String filename) {
-    if (!SD.begin(SD_CS_PIN)) {
+    if (!sdCardAvailable) {
         Serial.println("SD card not available");
         return false;
     }
     
-    Serial.printf("Saving image to SD: %s\n", filename.c_str());
+    Serial.printf("Saving image to SD via %s: %s\n", usingSDMMC ? "SDMMC" : "SPI", filename.c_str());
     
-    File file = SD.open(filename, FILE_WRITE);
+    File file;
+    if (usingSDMMC) {
+        file = SD_MMC.open(filename, FILE_WRITE);
+    } else {
+        file = SD.open(filename, FILE_WRITE);
+    }
+    
     if (!file) {
         Serial.println("Failed to open file for writing");
         return false;
@@ -530,14 +636,20 @@ bool saveImageToSD(uint8_t* imageData, size_t imageSize, String filename) {
 }
 
 void printSDCardContents() {
-    Serial.println("\n=== SD CARD CONTENTS ===");
+    Serial.printf("\n=== SD CARD CONTENTS (via %s) ===\n", usingSDMMC ? "SDMMC" : "SPI");
     
-    if (!SD.begin(SD_CS_PIN)) {
+    if (!sdCardAvailable) {
         Serial.println("SD card not available");
         return;
     }
     
-    File root = SD.open("/");
+    File root;
+    if (usingSDMMC) {
+        root = SD_MMC.open("/");
+    } else {
+        root = SD.open("/");
+    }
+    
     if (!root) {
         Serial.println("Failed to open root directory");
         return;
@@ -548,7 +660,13 @@ void printSDCardContents() {
     
     // Print images directory specifically
     Serial.println("\n--- Images Directory ---");
-    File imagesDir = SD.open("/images");
+    File imagesDir;
+    if (usingSDMMC) {
+        imagesDir = SD_MMC.open("/images");
+    } else {
+        imagesDir = SD.open("/images");
+    }
+    
     if (imagesDir) {
         printDirectory(imagesDir, 0);
         imagesDir.close();
@@ -603,16 +721,16 @@ void printDetailedSDCardInfo() {
     Serial.println("\n=== PERIODIC SD CARD REPORT ===");
     Serial.printf("Scan Time: %s\n", getTimeString().c_str());
     
-    if (!SD.begin(SD_CS_PIN)) {
+    if (!SD_MMC.begin()) {
         Serial.println("SD card not available");
         return;
     }
     
     // Get card information
-    uint8_t cardType = SD.cardType();
-    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-    uint64_t usedBytes = SD.usedBytes();
-    uint64_t totalBytes = SD.totalBytes();
+    uint8_t cardType = SD_MMC.cardType();
+    uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+    uint64_t usedBytes = SD_MMC.usedBytes();
+    uint64_t totalBytes = SD_MMC.totalBytes();
     
     Serial.printf("Card Type: %s\n", 
                   cardType == CARD_MMC ? "MMC" :
@@ -626,7 +744,7 @@ void printDetailedSDCardInfo() {
     
     // List all files in images directory with details
     Serial.println("\n=== IMAGES DIRECTORY CONTENTS ===");
-    File imagesDir = SD.open("/images");
+    File imagesDir = SD_MMC.open("/images");
     if (imagesDir) {
         int fileCount = 0;
         size_t totalImageSize = 0;
@@ -686,14 +804,20 @@ void printUploadStatistics() {
 }
 
 void uploadImageFromSD(String filename) {
-    Serial.printf("Starting upload from SD card: %s\n", filename.c_str());
+    Serial.printf("Starting upload from SD card via %s: %s\n", usingSDMMC ? "SDMMC" : "SPI", filename.c_str());
     
-    if (!SD.begin(SD_CS_PIN)) {
+    if (!sdCardAvailable) {
         Serial.println("SD card not available for upload");
         return;
     }
     
-    File file = SD.open(filename);
+    File file;
+    if (usingSDMMC) {
+        file = SD_MMC.open(filename);
+    } else {
+        file = SD.open(filename);
+    }
+    
     if (!file) {
         Serial.println("Failed to open file for reading");
         return;
